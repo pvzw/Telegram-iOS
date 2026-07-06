@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: recursive 
       - name: Apply patches
         run: |
           find . -name "AccountInfoController.swift" -exec sed -i '' \
