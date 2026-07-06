@@ -1,4 +1,4 @@
-name: Build Telegram IPA
+name: Build Telegram IPA 
 on: [push]
 jobs:
   build:
