@@ -1,109 +1,72 @@
-name: CI
-
-on:
-  push:
-    branches: [ master ]
-
-  workflow_dispatch:
-
+name: Build Telegram IPA
+on: [push]
 jobs:
   build:
-    runs-on: macos-13
-
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
-
-      - name: Set active Xcode path
+          submodules: recursive
+      - name: Apply patches
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
-
-      - name: Create canonical source directory
+          find . -name "AccountInfoController.swift" -exec sed -i '' \
+          's/self\._username = presentationData\.user?\.username ?? ""/let realUsername = presentationData.user?.username ?? ""; let spoofedUsername = UserDefaults.standard.string(forKey: "spoofed_username") ?? realUsername; self._username = spoofedUsername/g' {} \;
+          mkdir -p Telegram/SourceFiles/NFT
+          cat > Telegram/SourceFiles/NFT/NFTCollectionManager.swift << 'EOF'
+          import UIKit
+          import Foundation
+          @objc public class NFTCollectionManager: NSObject {
+              @objc public static let shared = NFTCollectionManager()
+              private let storageKey = "local_nft_collection"
+              @objc public func loadLocalNFTs() -> [[String: Any]]? {
+                  guard let data = UserDefaults.standard.data(forKey: storageKey) else { return nil }
+                  return try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+              }
+              @objc public func saveLocalNFTs(_ nfts: [[String: Any]]) {
+                  if let data = try? JSONSerialization.data(withJSONObject: nfts) {
+                      UserDefaults.standard.set(data, forKey: storageKey)
+                  }
+              }
+              @objc public func addNFT(name: String, imageURL: String, collection: String) {
+                  var current = loadLocalNFTs() ?? []
+                  let entry: [String: Any] = [
+                      "name": name,
+                      "image": imageURL,
+                      "collection": collection,
+                      "timestamp": Date().timeIntervalSince1970
+                  ]
+                  current.append(entry)
+                  saveLocalNFTs(current)
+              }
+          }
+          EOF
+          cat > Telegram/SourceFiles/NFT/UsernameSpoofer.swift << 'EOF'
+          import Foundation
+          @objc public class UsernameSpoofer: NSObject {
+              @objc public static let shared = UsernameSpoofer()
+              @objc public func setSpoofedUsername(_ username: String) {
+                  UserDefaults.standard.set(username, forKey: "spoofed_username")
+                  NotificationCenter.default.post(name: NSNotification.Name("UsernameSpoofed"), object: nil)
+              }
+              @objc public func getSpoofedUsername() -> String {
+                  return UserDefaults.standard.string(forKey: "spoofed_username") ?? ""
+              }
+              @objc public func resetToReal() {
+                  UserDefaults.standard.removeObject(forKey: "spoofed_username")
+              }
+          }
+          EOF
+          find . -name "AppDelegate.swift" -exec sed -i '' '/func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions:/a \
+          _ = NFTCollectionManager.shared\n        _ = UsernameSpoofer.shared' {} \;
+      - name: Install dependencies
         run: |
-          set -x
-          sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
-
-      - name: Build the App
+          brew install cocoapods
+          pod install --repo-update
+      - name: Archive and export
         run: |
-          set -x
-
-          # source code paths are included in the final binary, so we need to make them stable across builds
-          SOURCE_DIR=/Users/Shared/telegram-ios
-
-          # use canonical bazel root
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-
-          cd $SOURCE_DIR
-
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
-          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
-
-          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
-          python3 -u build-system/Make/Make.py \
-            --bazelUserRoot="$BAZEL_USER_ROOT" \
-            build \
-            --configurationPath="build-system/appstore-configuration.json" \
-            --codesigningInformationPath=build-system/fake-codesigning \
-            --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER"
-
-          # collect ipa
-          OUTPUT_PATH="build/artifacts"
-          rm -rf "$OUTPUT_PATH"
-          mkdir -p "$OUTPUT_PATH"
-          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            cp "$f" $OUTPUT_PATH/
-          done
-
-          # collect dsym
-          mkdir -p build/DSYMs
-          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
-            cp -R "$f" build/DSYMs/
-          done
-          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          xcodebuild archive -workspace Telegram.xcworkspace -scheme Telegram -archivePath ./Telegram.xcarchive CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          xcodebuild -exportArchive -archivePath ./Telegram.xcarchive -exportPath ./ -exportOptionsPlist /dev/null -allowProvisioningUpdates
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ env.BUILD_NUMBER }}
-          release_name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          body: |
-            An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          draft: false
-          prerelease: false
-
-      - name: Upload Release IPA
-        id: upload-release-ipa 
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
-          asset_name: Telegram.ipa
-          asset_content_type: application/zip
-
-      - name: Upload Release DSYM
-        id: upload-release-dsym 
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
-          asset_name: Telegram.DSYMs.zip
-          asset_content_type: application/zip
+          name: Telegram-ipa
+          path: ./Telegram.ipa
